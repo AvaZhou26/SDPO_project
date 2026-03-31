@@ -1,4 +1,4 @@
-# Self-Distillation Policy Optimization from User Interactions
+# Aligning Language Models from User Interactions
 
 This repository contains the training and evaluation code for **Self-Distillation Policy Optimization (SDPO) from User Interactions**.
 
