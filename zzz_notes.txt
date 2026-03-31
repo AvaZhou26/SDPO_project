@@ -1,6 +1,0 @@
-scp -r ./* clariden:~/user_interactions/
-
-
-scp -O ./auxiliary/user_simulator.py clariden:~/user_interactions/auxiliary/user_simulator.py
-
-
