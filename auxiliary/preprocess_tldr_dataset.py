@@ -5,7 +5,9 @@ import hashlib
 from datasets import load_dataset, DatasetDict, Features, Value, concatenate_datasets
 
 # --- Config ---
-ADD_TLDR_SUFFIX = True
+TLDR_INSTRUCTION = (
+    "Write a brief summary of the text that begins with 'TL;DR:'.\n\n"
+)
 N_EXAMPLES_TO_PRINT = 5
 NORMALIZE_FOR_DEDUP = True     # whitespace + lowercase
 CROSS_SPLIT_DEDUP = True       # ensure val has no items that appear in train
@@ -36,8 +38,7 @@ def to_prompt(example):
     prompt = (info.get("post") or info.get("article") or "").strip()
     if not prompt:
         return {"prompt": "", "keep": False}
-    if ADD_TLDR_SUFFIX:
-        prompt = prompt + "\nTL;DR:\n"
+    prompt = TLDR_INSTRUCTION + prompt
 
     if len(prompt) >= MAX_PROMPT_LEN:
         return {"prompt": "", "keep": False}

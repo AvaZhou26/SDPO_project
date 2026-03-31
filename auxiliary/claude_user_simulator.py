@@ -58,7 +58,7 @@ class ClaudeStyleUserSimulator(UserSimulator):
             "- Respond as the user with the USER PROFILE above in straightforward language.\n"
             "- Judge ONLY the assistant's response with respect to the preferences in the USER PROFILE; NOTHING ELSE\n"
             "- Do NOT answer the original request yourself.\n"
-            "- Respond very briefly.\n"
+            "- Respond very briefly in at most two sentences.\n"
             "- Do NOT give general feedback that does not relate to the USER PROFILE.\n"
             "- Output ONLY the user message text (no labels, no preface).\n"
             "- If the assistant answered well with respect to the USER PROFILE, you can say so briefly.\n"

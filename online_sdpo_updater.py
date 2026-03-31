@@ -21,12 +21,12 @@ from transformers import (
     TextIteratorStreamer,
 )
 
-from live_config import LiveSDPOConfig
+from online_sdpo_updater_config import OnlineSDPOConfig
 
 
-class LiveSDPOUpdater:
+class OnlineSDPOUpdater:
 
-    def __init__(self, config: LiveSDPOConfig):
+    def __init__(self, config: OnlineSDPOConfig):
         self.config = config
         self.step = 0
         self.metrics_history: List[Dict] = []
@@ -108,6 +108,7 @@ class LiveSDPOUpdater:
                 trainable_params,
                 lr=self.config.learning_rate,
                 weight_decay=self.config.weight_decay,
+                eps=self.config.adam_epsilon,
             )
 
     def _setup_generation_config(self):
@@ -126,7 +127,7 @@ class LiveSDPOUpdater:
 
     def _init_vllm(self):
         import os as _os
-        _os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"  # ensure both GPUs visible
+        _os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # pin vLLM to GPU 0
 
         from vllm import LLM
         print("[LIVE SDPO] Initializing vLLM on GPU 0...", flush=True)
@@ -136,14 +137,24 @@ class LiveSDPOUpdater:
             gpu_memory_utilization=self.config.vllm_gpu_memory_utilization,
             enable_lora=True,
             max_lora_rank=self.config.lora_r,
-            device="cuda:0",
         )
+        # Restore visibility for training model on GPU 1 and user sim on GPU 2+
+        _os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"
         print("[LIVE SDPO] vLLM ready.", flush=True)
+
+    def _get_vllm_lora_request(self):
+        from vllm.lora.request import LoRARequest
+        if self._latest_lora_path is not None:
+            return LoRARequest(
+                f"live_adapter_{self._lora_request_id}",
+                self._lora_request_id,
+                self._latest_lora_path,
+            )
+        return None
 
     def _generate_vllm(self, messages: List[Dict[str, str]]) -> str:
         """Generate using vLLM engine on GPU 0."""
         from vllm import SamplingParams
-        from vllm.lora.request import LoRARequest
 
         prompt_text = self.tokenizer.apply_chat_template(
             messages,
@@ -158,20 +169,154 @@ class LiveSDPOUpdater:
             max_tokens=self.config.max_new_tokens,
         )
 
-        lora_request = None
-        if self._latest_lora_path is not None:
-            lora_request = LoRARequest(
-                f"live_adapter_{self._lora_request_id}",
-                self._lora_request_id,
-                self._latest_lora_path,
-            )
-
         outputs = self.llm.generate(
             prompt_text,
             sampling_params=sampling_params,
-            lora_request=lora_request,
+            lora_request=self._get_vllm_lora_request(),
         )
         return outputs[0].outputs[0].text
+
+    def generate_responses_batch(
+        self,
+        messages_list: List[List[Dict[str, str]]],
+        max_new_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+    ) -> List[str]:
+        """Generate responses for multiple prompts in a single batched call.
+
+        Uses vLLM batched generation if available, otherwise replicates the
+        model across available GPUs for parallel HF generation.
+        """
+        if self.config.use_vllm:
+            return self._generate_vllm_batch(messages_list, max_new_tokens, temperature)
+
+        return self._generate_hf_batch_parallel(messages_list, max_new_tokens, temperature)
+
+    def _generate_hf_single(
+        self,
+        model: torch.nn.Module,
+        device: torch.device,
+        messages_chunk: List[List[Dict[str, str]]],
+        gen_config: "GenerationConfig",
+    ) -> List[str]:
+        """Generate completions for a chunk of prompts on one device."""
+        results = []
+        for messages in messages_chunk:
+            prompt_text = self.tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True, enable_thinking=False,
+            )
+            enc = self.tokenizer(
+                prompt_text, return_tensors="pt", add_special_tokens=False,
+                truncation=True, max_length=self.config.max_context_length,
+            ).to(device)
+            with torch.no_grad():
+                output_ids = model.generate(**enc, generation_config=gen_config)
+                new_tokens = output_ids[0, enc["input_ids"].shape[1]:]
+                results.append(self.tokenizer.decode(new_tokens, skip_special_tokens=True))
+        return results
+
+    def _generate_hf_batch_parallel(
+        self,
+        messages_list: List[List[Dict[str, str]]],
+        max_new_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+    ) -> List[str]:
+        """Replicate model across GPUs and generate in parallel threads."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        self._enter_inference_mode()
+
+        # Build generation config for eval
+        do_sample = (temperature or self.config.temperature) > 0
+        gen_config = GenerationConfig(
+            max_new_tokens=max_new_tokens or self.config.max_new_tokens,
+            do_sample=do_sample,
+            temperature=temperature if temperature is not None else self.config.temperature,
+            eos_token_id=self.tokenizer.eos_token_id,
+            pad_token_id=self.tokenizer.pad_token_id,
+        )
+
+        n_gpus = torch.cuda.device_count()
+        if n_gpus <= 1:
+            return self._generate_hf_single(self.model, self.device, messages_list, gen_config)
+
+        # Split prompts into chunks
+        n = len(messages_list)
+        chunks = []
+        for g in range(n_gpus):
+            start = g * n // n_gpus
+            end = (g + 1) * n // n_gpus
+            if start < end:
+                chunks.append((g, messages_list[start:end]))
+
+        # Create model replicas on other GPUs
+        replicas: Dict[int, Tuple[torch.nn.Module, torch.device]] = {}
+        src_gpu = self.device.index or 0
+        for gpu_idx, _ in chunks:
+            dev = torch.device(f"cuda:{gpu_idx}")
+            if gpu_idx == src_gpu:
+                replicas[gpu_idx] = (self.model, dev)
+            else:
+                replica = copy.deepcopy(self.model).to(dev)
+                replica.eval()
+                replicas[gpu_idx] = (replica, dev)
+
+        print(f"[EVAL] Parallel generation on {len(chunks)} GPUs ({n} prompts)", flush=True)
+
+        # Generate in parallel threads (GIL released during CUDA)
+        all_results: Dict[int, List[str]] = {}
+        with ThreadPoolExecutor(max_workers=len(chunks)) as pool:
+            futures = {
+                pool.submit(
+                    self._generate_hf_single,
+                    replicas[gpu_idx][0], replicas[gpu_idx][1], chunk, gen_config,
+                ): gpu_idx
+                for gpu_idx, chunk in chunks
+            }
+            for fut in futures:
+                gpu_idx = futures[fut]
+                all_results[gpu_idx] = fut.result()
+
+        # Cleanup replicas
+        for gpu_idx, (model_ref, _) in replicas.items():
+            if gpu_idx != src_gpu:
+                del model_ref
+        torch.cuda.empty_cache()
+
+        # Reassemble in order
+        completions = []
+        for gpu_idx, _ in chunks:
+            completions.extend(all_results[gpu_idx])
+        return completions
+
+    def _generate_vllm_batch(
+        self,
+        messages_list: List[List[Dict[str, str]]],
+        max_new_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+    ) -> List[str]:
+        """Batched generation using vLLM — all prompts in one call."""
+        from vllm import SamplingParams
+
+        prompt_texts = [
+            self.tokenizer.apply_chat_template(
+                msgs, tokenize=False, add_generation_prompt=True, enable_thinking=False,
+            )
+            for msgs in messages_list
+        ]
+
+        sampling_params = SamplingParams(
+            temperature=temperature if temperature is not None else self.config.temperature,
+            top_p=self.config.top_p,
+            max_tokens=max_new_tokens if max_new_tokens is not None else self.config.max_new_tokens,
+        )
+
+        outputs = self.llm.generate(
+            prompt_texts,
+            sampling_params=sampling_params,
+            lora_request=self._get_vllm_lora_request(),
+        )
+        return [out.outputs[0].text for out in outputs]
 
     # ------------------------------------------------------------------ #
     #  Generation (inference mode)
@@ -301,8 +446,10 @@ class LiveSDPOUpdater:
         tokenizer.truncation_side = old_trunc_side
 
         y_ids = completion_ids.to(self.device)          # (1, C)
-        pad_id = tokenizer.pad_token_id
-        y_mask = (y_ids != pad_id).long()               # (1, C)
+        # completion_ids is a single example (no padding), so all tokens
+        # including the trailing EOS are real.  The old mask
+        # (y_ids != pad_id) incorrectly zeroed EOS when pad_id == eos_id.
+        y_mask = torch.ones_like(y_ids)                  # (1, C)
 
         input_ids = torch.cat([enc["input_ids"], y_ids], dim=1)
         attention_mask = torch.cat([enc["attention_mask"], y_mask], dim=1)
@@ -394,27 +541,29 @@ class LiveSDPOUpdater:
             enable_thinking=False,
         )
 
-        # ---- compute loss ----
-        if self.config.loss_mode == "simple_signal":
-            loss, metrics = self._simple_signal_loss(x_text, xo_text, completion_ids)
-        elif self.config.loss_mode == "full_distillation":
-            loss, metrics = self._full_distillation_loss(x_text, xo_text, completion_ids)
-        else:
-            raise ValueError(f"Unknown loss_mode: {self.config.loss_mode}")
+        # ---- K gradient steps on this example ----
+        K = self.config.train_steps_per_example
+        for k in range(K):
+            if self.config.loss_mode == "simple_signal":
+                loss, metrics = self._simple_signal_loss(x_text, xo_text, completion_ids)
+            elif self.config.loss_mode == "full_distillation":
+                loss, metrics = self._full_distillation_loss(x_text, xo_text, completion_ids)
+            else:
+                raise ValueError(f"Unknown loss_mode: {self.config.loss_mode}")
 
-        # ---- backward + clip + step ----
-        loss.backward()
-        grad_norm = torch.nn.utils.clip_grad_norm_(
-            [p for p in self.model.parameters() if p.requires_grad],
-            self.config.max_grad_norm,
-        )
-        self.optimizer.step()
-        self.optimizer.zero_grad()
+            loss.backward()
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                [p for p in self.model.parameters() if p.requires_grad],
+                self.config.max_grad_norm,
+            )
+            self.optimizer.step()
+            self.optimizer.zero_grad()
 
         self.step += 1
         metrics["step"] = self.step
         metrics["grad_norm"] = grad_norm.item()
         metrics["loss"] = loss.item()
+        metrics["train_steps_per_example"] = K
         metrics["train_time_s"] = round(time.time() - t0, 2)
         self.metrics_history.append(metrics)
 
@@ -423,6 +572,7 @@ class LiveSDPOUpdater:
             adapter_path = os.path.join(self.config.checkpoint_dir, "_live_adapter")
             os.makedirs(adapter_path, exist_ok=True)
             self.model.save_pretrained(adapter_path)
+            self.tokenizer.save_pretrained(adapter_path)
             self._latest_lora_path = adapter_path
             self._lora_request_id += 1
 
@@ -550,7 +700,7 @@ class LiveSDPOUpdater:
             )
 
         # Student: pi(·|x) — with grad
-        _, mask_x, logits_x = self._compute_token_logprobs(
+        logps_x, mask_x, logits_x = self._compute_token_logprobs(
             x_text, completion_ids, need_grad=True, need_logits=True,
         )
 
@@ -588,6 +738,7 @@ class LiveSDPOUpdater:
 
         metrics = {
             "kl_mean": (per_token_kl.detach() * mask_f).sum().item() / total_tokens.item(),
+            "policy_logp_mean": (logps_x.detach() * mask_f).sum().item() / total_tokens.item(),
             "completion_tokens": int(total_tokens.item()),
             "loss_mode": "full_distillation",
         }
@@ -668,7 +819,16 @@ class LiveSDPOUpdater:
         ckpt_path = os.path.join(self.config.checkpoint_dir, tag)
         os.makedirs(ckpt_path, exist_ok=True)
 
-        self.model.save_pretrained(ckpt_path)
+        # Merge LoRA into base on CPU so the checkpoint is a standalone HF model
+        # that can be loaded directly via AutoModelForCausalLM.from_pretrained().
+        # Deep-copy to CPU to avoid disrupting the live training state or GPU memory.
+        if self.config.use_lora:
+            merged = copy.deepcopy(self.model).cpu().merge_and_unload()
+            merged.save_pretrained(ckpt_path)
+            del merged
+            torch.cuda.empty_cache()
+        else:
+            self.model.save_pretrained(ckpt_path)
         self.tokenizer.save_pretrained(ckpt_path)
 
         torch.save(

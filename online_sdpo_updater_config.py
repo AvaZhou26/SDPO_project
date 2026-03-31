@@ -3,7 +3,7 @@ from typing import Optional
 
 
 @dataclass
-class LiveSDPOConfig:
+class OnlineSDPOConfig:
     # ── Model ──
     model_name_or_path: str = "Qwen/Qwen3-8B"
     torch_dtype: str = "bfloat16"
@@ -11,8 +11,8 @@ class LiveSDPOConfig:
 
     # ── LoRA (set use_lora=True to enable) ──
     use_lora: bool = False
-    lora_r: int = 64
-    lora_alpha: int = 128
+    lora_r: int = 256
+    lora_alpha: int = 512
     lora_target_modules: list[str] = field(default_factory=lambda: [
         "q_proj", "k_proj", "v_proj", "o_proj",
         "gate_proj", "up_proj", "down_proj",
@@ -23,7 +23,7 @@ class LiveSDPOConfig:
     signal_clip: float = 0.0  # 0 = no clipping
     ignore_first_k: int = 0
     loss_mode: str = "full_distillation"  # "simple_signal" | "full_distillation"
-    distillation_topk: int = 50       # top-k logits for full_distillation
+    distillation_topk: int = 20       # top-k logits for full_distillation
     distillation_add_tail: bool = True  # True = add tail bucket, False = renormalize top-k
 
     # ── Training schedule ──
@@ -31,17 +31,21 @@ class LiveSDPOConfig:
     use_vllm: bool = False        # True = vLLM on GPU 0, training on GPU 1 (forces LoRA + async)
     vllm_gpu_memory_utilization: float = 0.9
 
+    # ── Training ──
+    train_steps_per_example: int = 1  # K gradient steps per interaction
+
     # ── Optimizer ──
-    learning_rate: float = 1e-5
+    learning_rate: float = 5e-6
     optimizer: str = "adamw"  # "adamw" | "adamw_8bit"
+    adam_epsilon: float = 1e-6
     max_grad_norm: float = 1.0
     weight_decay: float = 0.0
 
     # ── Generation ──
     max_new_tokens: int = 2048
     max_context_length: int = 4096
-    temperature: float = 0.7
-    top_p: float = 0.9
+    temperature: float = 1.0
+    top_p: float = 1.0
     do_sample: bool = True
 
     # ── Hindsight prompt format (matches offline_trainer.py:64-70) ──

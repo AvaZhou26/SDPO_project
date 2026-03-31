@@ -1,3 +1,32 @@
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+
+# Secrets
+.env
+
+# Data & outputs
 test-time-alignment/
-.claude/
 data/
+plots/
+plotting/
+eval/
+wandb/
+output/
+
+# IDE / tooling
+.claude/
+
+# Internal notes
+zzz_notes.txt
+
+# Cluster-specific scripts (sbatch + personal launchers)
+scripts/*.sbatch
+scripts/run_eval_checkpoints.sh
+scripts/run_eval_all_styles.sh
+
+# Files not part of public release
+auxiliary/generate_alpaca_accelerate.py
+auxiliary/eval_style_pairwise_accelerate.py
+live_chat/

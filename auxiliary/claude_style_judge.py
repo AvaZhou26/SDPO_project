@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import os
+import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import List, Optional
 
 from anthropic import Anthropic
@@ -29,7 +31,7 @@ class ClaudeStyleJudge:
         self,
         style: str,
         model: str = "claude-haiku-4-5-20251001",
-        max_tokens: int = 16,
+        max_tokens: int = 512,
         temperature: float = 0.0,
         max_retries: int = 8,
         base_backoff_s: float = 0.75,
@@ -60,7 +62,8 @@ class ClaudeStyleJudge:
             "- Judge ONLY style, tone, formatting, verbosity, and complexity relative to the persona.\n"
             "- Do NOT judge factual correctness.\n"
             "- Do NOT rewrite responses.\n"
-            "- Output exactly ONE character: A, B, or C.\n"
+            "- You may reason briefly about your decision.\n"
+            "- You MUST end your response with exactly: Judgement: A, Judgement: B, or Judgement: C\n"
             "- C means tie/uncertain.\n"
         )
 
@@ -75,7 +78,7 @@ class ClaudeStyleJudge:
             f"{a}\n\n"
             "Response B:\n"
             f"{b}\n\n"
-            "Which response do you prefer as this user? Output only A, B, or C."
+            "Which response do you prefer as this user? Reason briefly, then end with Judgement: A, Judgement: B, or Judgement: C."
         )
 
     def _call_once(self, prompt: str, a: str, b: str) -> int:
@@ -91,19 +94,35 @@ class ClaudeStyleJudge:
         for block in resp.content:
             if getattr(block, "type", None) == "text":
                 text_parts.append(block.text)
-        out = "".join(text_parts).strip().upper()
+        out = "".join(text_parts).strip()
+        return self._parse_judgement(out)
 
-        # Parse first occurrence of A/B/C
-        choice = None
-        for ch in out:
-            if ch in ("A", "B", "C"):
-                choice = ch
-                break
+    @staticmethod
+    def _parse_judgement(text: str) -> int:
+        """Extract decision from 'Judgement: A/B/C' at the end of the output.
+        Falls back to last standalone A/B/C if the structured format is missing."""
+        clean = text.strip()
+        if not clean:
+            return -1
 
-        if choice == "A":
-            return 0
-        if choice == "B":
-            return 1
+        # Look for 'Judgement: X' (case-insensitive, allow 'Judgment' too)
+        m = re.search(r'[Jj]udge?ment:\s*([ABCabc])', clean)
+        if m:
+            letter = m.group(1).upper()
+            if letter == 'A':
+                return 0
+            if letter == 'B':
+                return 1
+            return -1
+
+        # Fallback: last standalone A/B/C character
+        for char in reversed(clean.upper()):
+            if char == 'A':
+                return 0
+            if char == 'B':
+                return 1
+            if char == 'C':
+                return -1
         return -1
 
     def _call_with_retries(self, prompt: str, a: str, b: str) -> int:
@@ -134,6 +153,7 @@ class ClaudeStyleJudge:
         completions_a: List[str],
         completions_b: List[str],
         batch_size: int = 16,
+        max_workers: int = 16,
     ) -> List[int]:
         assert len(prompts) == len(completions_a) == len(completions_b)
         n = len(prompts)
@@ -142,16 +162,20 @@ class ClaudeStyleJudge:
         for start in range(0, n, batch_size):
             end = min(n, start + batch_size)
 
-            # Forward AB
-            d_ab = [
-                self._call_with_retries(prompts[i], completions_a[i], completions_b[i])
-                for i in range(start, end)
-            ]
-            # Backward BA
-            d_ba = [
-                self._call_with_retries(prompts[i], completions_b[i], completions_a[i])
-                for i in range(start, end)
-            ]
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                # Forward AB + backward BA — all concurrent
+                futs_ab = [
+                    pool.submit(self._call_with_retries, prompts[i], completions_a[i], completions_b[i])
+                    for i in range(start, end)
+                ]
+                futs_ba = [
+                    pool.submit(self._call_with_retries, prompts[i], completions_b[i], completions_a[i])
+                    for i in range(start, end)
+                ]
+
+                d_ab = [f.result() for f in futs_ab]
+                d_ba = [f.result() for f in futs_ba]
+
             d_ba_inv = self._invert_ab(d_ba)
 
             for x, y in zip(d_ab, d_ba_inv):

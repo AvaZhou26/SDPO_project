@@ -1,28 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Compute and visualize the SDPO per-token signal (log-ratio) on a set of
-# prompt/feedback cases.
+# Evaluate an in-context oracle baseline: the model receives the style
+# instruction directly in the prompt rather than learning from interactions.
 #
 # Usage:
-#   ./scripts/run_signal_analysis.sh [--dry-run]
+#   ./scripts/eval_incontext_oracle.sh [--dry-run]
 #
 # Common overrides:
-#   MODEL="Qwen/Qwen3-8B" ./scripts/run_signal_analysis.sh
-#   CASES_JSON=./auxiliary/signal_analysis_cases.json ./scripts/run_signal_analysis.sh
-#   N_CASES=8 ./scripts/run_signal_analysis.sh
-#
-# Outputs in OUT_DIR:
-#   sdpo_signals.json       — raw per-token signals for all cases
-#   unrelated.png           — heatmap: P(y|x,o_unrelated) - P(y|x)
-#   followup.png            — heatmap: P(y|x,o_followup)  - P(y|x)
-#   stacked.png             — both heatmaps stacked vertically
-#   side_by_side.png        — both heatmaps side by side
-#   case{N}_tokens.png      — token-level colored boxes for one case
+#   MODEL="Qwen/Qwen3-8B" ./scripts/eval_incontext_oracle.sh
+#   EVAL_N=50 SEED=42 ./scripts/eval_incontext_oracle.sh
+#   DATA_DIR=/path/to/data ./scripts/eval_incontext_oracle.sh
 
 DRY_RUN=false
 if [[ "${1:-}" == "--dry-run" ]]; then
   DRY_RUN=true
+  shift
   echo "Dry run mode enabled. Commands will be printed but not executed."
 fi
 
@@ -38,7 +31,6 @@ run() {
 # Paths
 # =============================================================================
 REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
-SCRIPT="${SCRIPT:-$REPO_ROOT/auxiliary/sdpo_signal_analysis.py}"
 
 # Load API keys from .env if present
 if [[ -f "$REPO_ROOT/.env" ]]; then
@@ -51,43 +43,50 @@ fi
 # Configuration
 # =============================================================================
 MODEL="${MODEL:-Qwen/Qwen3-8B}"
-CASES_JSON="${CASES_JSON:-$REPO_ROOT/auxiliary/signal_analysis_cases.json}"
-N_CASES="${N_CASES:-24}"
-SEED="${SEED:-123}"
+JUDGE_MODEL="${JUDGE_MODEL:-Qwen/Qwen3-32B}"
+EVAL_N="${EVAL_N:-100}"
+SEED="${SEED:-1234}"
+# Note: data/ is not included in the repo — prepare it first (see README)
+DATA_DIR="${DATA_DIR:-$REPO_ROOT/data/tldr_prompts_unique}"
 
 # =============================================================================
 # Output + caches (portable)
 # =============================================================================
 BASE_WORK="${BASE_WORK:-${SCRATCH:-${TMPDIR:-/tmp}}}"
-RUN_ID="${RUN_ID:-signal-analysis-$(date +%Y%m%d-%H%M%S)}"
-
-OUT_DIR="${OUT_DIR:-$BASE_WORK/signal-analysis/$RUN_ID}"
 CACHE_DIR="${CACHE_DIR:-$BASE_WORK/hf-cache}"
 
-mkdir -p "$OUT_DIR" "$CACHE_DIR"/{hf,datasets,hub}
+mkdir -p "$CACHE_DIR"/{hf,datasets,hub}
 
 export HF_HOME="$CACHE_DIR/hf"
 export HF_DATASETS_CACHE="$CACHE_DIR/datasets"
 export TRANSFORMERS_CACHE="$CACHE_DIR/hub"
-
 export PYTHONPATH="$REPO_ROOT:${PYTHONPATH:-}"
+export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 
-#   export HF_TOKEN=...
 unset SSL_CERT_FILE SSL_CERT_DIR || true
 
-echo "REPO_ROOT=$REPO_ROOT"
-echo "MODEL=$MODEL"
-echo "CASES_JSON=$CASES_JSON"
-echo "N_CASES=$N_CASES  SEED=$SEED"
-echo "OUT_DIR=$OUT_DIR"
-echo
+# =============================================================================
+# Summary
+# =============================================================================
+echo "=== IN-CONTEXT ORACLE ==="
+echo "GPUs:        $(nvidia-smi -L 2>/dev/null | wc -l || echo 'N/A')"
+echo "Date:        $(date)"
+echo "Model:       $MODEL"
+echo "Judge:       $JUDGE_MODEL"
+echo "EVAL_N=$EVAL_N SEED=$SEED"
+echo "DATA_DIR:    $DATA_DIR"
+echo ""
 
+# =============================================================================
+# Run
+# =============================================================================
 cd "$REPO_ROOT"
 
-run "python \"$SCRIPT\" \
+run "python auxiliary/eval_incontext_oracle.py \
   --model \"$MODEL\" \
-  --cases_json \"$CASES_JSON\" \
-  --out_dir \"$OUT_DIR\" \
-  --n_cases \"$N_CASES\" \
-  --seed \"$SEED\""
+  --judge_model \"$JUDGE_MODEL\" \
+  --val_jsonl \"$DATA_DIR/validation.jsonl\" \
+  --eval_n \"$EVAL_N\" \
+  --seed \"$SEED\" \
+  \"\$@\""

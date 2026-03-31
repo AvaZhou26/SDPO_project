@@ -4,16 +4,10 @@ from dataclasses import dataclass
 import torch
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from online_sdpo_config import SDPOConfig
-from online_sdpo_trainer import SDPOOnlineTrainer
+from simple_pg.online_sdpo_config import SDPOConfig
+from simple_pg.online_sdpo_trainer import SDPOOnlineTrainer
 from auxiliary.user_simulator import StyleUserSimulator
 from auxiliary.claude_user_simulator import ClaudeStyleUserSimulator
-
-
-SYSTEM_PROMPT_TLDR = (
-    "Write summary of the text that is 1-2 sentences long. Always begin with 'TL;DR:' and output only the summary."
-)
-SYSTEM_PROMPT_GENERAL = ""
 
 
 def parse_args():
@@ -23,13 +17,6 @@ def parse_args():
     p.add_argument("--gradient_accumulation_steps", type=int, default=2)
     p.add_argument("--style", type=str, default="concise_casual_beginner")
     p.add_argument("--model_name_or_path", type=str, default="Qwen/Qwen3-8B")
-    p.add_argument(
-        "--system_prompt",
-        type=str,
-        default="general",
-        choices=["tldr", "general"],
-        help="Choose which system prompt experiment to run.",
-    )
     p.add_argument("--train_jsonl", type=str, required=True)
     p.add_argument("--val_jsonl", type=str, required=True)
     p.add_argument("--max_prompt_tokens", type=int, default=512)
@@ -58,22 +45,9 @@ def dummy_reward(prompts, completions, **kwargs):
     return [0.0] * len(completions)
 
 
-def strip_tldr_suffix(prompt: str) -> str:
-    s = prompt.rstrip()
-    for m in ["\nTL;DR:\n", "\nTL;DR:", "TL;DR:\n", "TL;DR:"]:
-        if s.endswith(m):
-            return s[: -len(m)].rstrip()
-    return s
-
-
 def main():
     cli = parse_args()
     args = ScriptArgs(model_name_or_path=cli.model_name_or_path)
-
-    if cli.system_prompt == "tldr":
-        system_prompt = SYSTEM_PROMPT_TLDR
-    else:
-        system_prompt = SYSTEM_PROMPT_GENERAL
 
     tok = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=True, padding_side="left")
     if tok.pad_token is None:
@@ -88,11 +62,8 @@ def main():
     eval_ds = dsd[args.dataset_test_split]
 
     def to_chat(example):
-        raw = strip_tldr_suffix(example["prompt"]).strip()
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": raw},
-        ]
+        raw = example["prompt"].strip()
+        messages = [{"role": "user", "content": raw}]
         rendered = tok.apply_chat_template(
             messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
         )
@@ -117,8 +88,6 @@ def main():
     print("Train size:", len(train_ds))
     print("Eval size:", len(eval_ds))
     print("STYLE:", cli.style)
-    print("SYSTEM_PROMPT:", cli.system_prompt)
-
     training_args = SDPOConfig(
         output_dir=args.output_dir,
         model_init_kwargs={"dtype": torch.bfloat16},
@@ -152,7 +121,6 @@ def main():
     )
     training_args.num_iterations = 1
     training_args.style = cli.style
-    training_args.system_prompt = system_prompt
 
     if cli.user_model_name_or_path is not None:
         print(f"Loading local user simulator: {cli.user_model_name_or_path}")

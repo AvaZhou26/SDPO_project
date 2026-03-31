@@ -1,5 +1,6 @@
 # style_judge.py
 from __future__ import annotations
+import re
 from typing import List, Dict, Tuple, Optional
 import torch
 import torch.nn.functional as F
@@ -36,19 +37,34 @@ class StyleJudge:
     def get_system_persona(self) -> str:
         return self.system_persona
 
-    def _build_prompt_text(self, raw_prompt: str, ca: str, cb: str) -> str:
-        user_msg = (
-            "You are shown two candidate responses to the same user prompt.\n\n"
-            f"User prompt:\n{raw_prompt}\n\n"
-            f"Response A:\n{ca}\n\n"
-            f"Response B:\n{cb}\n\n"
-            "As a user with the strong user persona described in the system message, "
-            "decide which response you prefer.\n\n"
-            "Respond with exactly one character:\n"
-            "A  if you prefer Response A\n"
-            "B  if you prefer Response B\n"
-            "C  only if you have no preference.\n"
+    def _build_system(self) -> str:
+        return (
+            f"{self.system_persona}\n\n"
+            "You are acting as a strict evaluator of WHICH response better matches your preference described in the USER PROFILE.\n"
+            "You must follow these rules:\n"
+            "- Judge ONLY style, tone, formatting, verbosity, and complexity relative to the persona.\n"
+            "- Do NOT judge factual correctness.\n"
+            "- Do NOT rewrite responses.\n"
+            "- You may reason briefly about your decision.\n"
+            "- You MUST end your response with exactly: Judgement: A, Judgement: B, or Judgement: C\n"
+            "- C means tie/uncertain.\n"
         )
+
+    def _build_prompt_text(self, raw_prompt: str, ca: str, cb: str) -> str:
+        # OLD prompt (kept for reference):
+        # user_msg = (
+        #     "You are shown two candidate responses to the same user prompt.\n\n"
+        #     f"User prompt:\n{raw_prompt}\n\n"
+        #     f"Response A:\n{ca}\n\n"
+        #     f"Response B:\n{cb}\n\n"
+        #     "As a user with the strong user persona described in the system message, "
+        #     "decide which response you prefer.\n\n"
+        #     "Respond with exactly one character:\n"
+        #     "A  if you prefer Response A\n"
+        #     "B  if you prefer Response B\n"
+        #     "C  only if you have no preference.\n"
+        # )
+        # TLDR variant (kept for reference):
         # user_msg = (
         #     "You are shown two candidate TL;DR summaries of the same text.\n\n"
         #     f"Original text:\n{raw_prompt}\n\n"
@@ -61,9 +77,19 @@ class StyleJudge:
         #     "B  if you prefer Summary B\n"
         #     "C  only if you have no preference.\n"
         # )
+        system = self._build_system()
+        user_msg = (
+            "User prompt:\n"
+            f"{raw_prompt}\n\n"
+            "Response A:\n"
+            f"{ca}\n\n"
+            "Response B:\n"
+            f"{cb}\n\n"
+            "Which response do you prefer as this user? Reason briefly, then end with Judgement: A, Judgement: B, or Judgement: C."
+        )
 
         chat = [
-            {"role": "system", "content": self.system_persona},
+            {"role": "system", "content": system},
             {"role": "user", "content": user_msg},
         ]
 
@@ -195,6 +221,34 @@ class StyleJudge:
         return decisions.tolist()
 
     @staticmethod
+    def _parse_judgement(text: str) -> int:
+        """Extract decision from 'Judgement: A/B/C' at the end of the output.
+        Falls back to last standalone A/B/C if the structured format is missing."""
+        clean = text.strip()
+        if not clean:
+            return -1
+
+        # Look for 'Judgement: X' (case-insensitive, allow 'Judgment' too)
+        m = re.search(r'[Jj]udge?ment:\s*([ABCabc])', clean)
+        if m:
+            letter = m.group(1).upper()
+            if letter == 'A':
+                return 0
+            if letter == 'B':
+                return 1
+            return -1
+
+        # Fallback: last standalone A/B/C character
+        for char in reversed(clean.upper()):
+            if char == 'A':
+                return 0
+            if char == 'B':
+                return 1
+            if char == 'C':
+                return -1
+        return -1
+
+    @staticmethod
     def _invert_ab(decisions: List[int]) -> List[int]:
         out = []
         for d in decisions:
@@ -292,7 +346,7 @@ class StyleJudge:
         return final_decisions
 
     def _get_generation_decisions(self, p, ca, cb) -> List[int]:
-        """Helper to generate text and parse for A/B/C."""
+        """Helper to generate text and parse for Judgement: A/B/C."""
         texts = [self._build_prompt_text(p[i], ca[i], cb[i]) for i in range(len(p))]
 
         enc = self.tok(
@@ -306,7 +360,7 @@ class StyleJudge:
         # Greedy generation (AlpacaEval uses low/zero temp)
         outputs = self.model.generate(
             **enc,
-            max_new_tokens=5,
+            max_new_tokens=1024,
             temperature=0,
             do_sample=False,
             pad_token_id=self.tok.pad_token_id
@@ -315,25 +369,11 @@ class StyleJudge:
         # Decode only the new tokens
         gen_texts = self.tok.batch_decode(outputs[:, enc["input_ids"].shape[1]:], skip_special_tokens=True)
 
+        # Store raw reasoning for debugging
+        self.last_raw_outputs = gen_texts
+
         batch_results = []
         for text in gen_texts:
-            clean = text.strip().upper()
-            if not clean:
-                batch_results.append(-1)
-                continue
-
-            # AlpacaEval logic: take the first valid label found
-            choice = -1
-            for char in clean:
-                if char == 'A':
-                    choice = 0
-                    break
-                if char == 'B':
-                    choice = 1
-                    break
-                if char == 'C':
-                    choice = -1
-                    break
-            batch_results.append(choice)
+            batch_results.append(self._parse_judgement(text))
 
         return batch_results

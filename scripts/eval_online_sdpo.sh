@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Evaluate saved checkpoints against a baseline model on one or more styles.
+# Run online SDPO evaluation: interleaved training + evaluation loop.
 #
 # Usage:
-#   CHECKPOINTS="/path/to/ckpt1 /path/to/ckpt2" BASELINE_MODEL="Qwen/Qwen3-8B" \
-#     ./scripts/eval_checkpoints.sh [--dry-run]
+#   ./scripts/eval_online_sdpo.sh [--dry-run]
 #
 # Common overrides:
-#   EVAL_STYLES="no_emojis answer_directly_reduce_formatting" ./scripts/eval_checkpoints.sh
-#   EVAL_N=50 USER_MODEL="Qwen/Qwen3-32B" ./scripts/eval_checkpoints.sh
+#   MODEL="Qwen/Qwen3-8B" STYLE="no_emojis" ./scripts/eval_online_sdpo.sh
+#   LR=1e-5 TRAIN_N=30 EVAL_N=50 ./scripts/eval_online_sdpo.sh
+#   BASELINE_MODEL=/path/to/baseline ./scripts/eval_online_sdpo.sh
 
 DRY_RUN=false
 if [[ "${1:-}" == "--dry-run" ]]; then
@@ -39,40 +39,30 @@ if [[ -f "$REPO_ROOT/.env" ]]; then
 fi
 
 # =============================================================================
-# Configuration (required args)
+# Configuration
 # =============================================================================
-CHECKPOINTS="${CHECKPOINTS:-}"
-BASELINE_MODEL="${BASELINE_MODEL:-}"
-
-if [[ -z "$CHECKPOINTS" ]]; then
-  echo "ERROR: CHECKPOINTS is required (space-separated list of checkpoint paths)"
-  echo "  Example: CHECKPOINTS=\"/path/to/ckpt1 /path/to/ckpt2\" $0"
-  exit 1
-fi
-
-if [[ -z "$BASELINE_MODEL" ]]; then
-  echo "ERROR: BASELINE_MODEL is required (path or HuggingFace model ID)"
-  echo "  Example: BASELINE_MODEL=\"Qwen/Qwen3-8B\" $0"
-  exit 1
-fi
-
-# =============================================================================
-# Configuration (optional)
-# =============================================================================
+MODEL="${MODEL:-Qwen/Qwen3-8B}"
+BASELINE_MODEL="${BASELINE_MODEL:-}"  # leave empty to use same model as baseline before any training
 USER_MODEL="${USER_MODEL:-Qwen/Qwen3-32B}"
-EVAL_STYLES="${EVAL_STYLES:-less_filler_praise_sycophancy no_emojis answer_directly_reduce_formatting}"
+STYLE="${STYLE:-no_emojis}"
+EVAL_STYLES="${EVAL_STYLES:-}"  # optionally add additional eval user profiles
+LR="${LR:-5e-6}"
+LOSS_MODE="${LOSS_MODE:-full_distillation}"
+TRAIN_N="${TRAIN_N:-15}"
 EVAL_N="${EVAL_N:-100}"
-SEED="${SEED:-42}"
-RUN_NAME="${RUN_NAME:-eval_checkpoints}"
+EVAL_EVERY="${EVAL_EVERY:-3}"
+TRAIN_STEPS_PER_EXAMPLE="${TRAIN_STEPS_PER_EXAMPLE:-1}"
+SEED="${SEED:-1234}"
+RUN_NAME="${RUN_NAME:-eval_online_sdpo}"
 DATA_DIR="${DATA_DIR:-$REPO_ROOT/data/helpsteer_prompts}"
 
 # =============================================================================
 # Output + caches (portable)
 # =============================================================================
 BASE_WORK="${BASE_WORK:-${SCRATCH:-${TMPDIR:-/tmp}}}"
-RUN_ID="${RUN_ID:-eval-checkpoints-$(date +%Y%m%d-%H%M%S)}"
+RUN_ID="${RUN_ID:-eval-online-sdpo-$(date +%Y%m%d-%H%M%S)}"
 
-OUTPUT_DIR="${OUTPUT_DIR:-$BASE_WORK/eval-checkpoints/$RUN_ID}"
+export OUTPUT_DIR="${OUTPUT_DIR:-$BASE_WORK/eval-online-sdpo/$RUN_ID}"
 CACHE_DIR="${CACHE_DIR:-$BASE_WORK/hf-cache}"
 
 mkdir -p "$OUTPUT_DIR" "$CACHE_DIR"/{hf,datasets,hub}
@@ -89,16 +79,16 @@ unset SSL_CERT_FILE SSL_CERT_DIR || true
 # =============================================================================
 # Summary
 # =============================================================================
-echo "=== EVAL CHECKPOINTS ==="
-echo "GPUs:        $(nvidia-smi -L 2>/dev/null | wc -l || echo 'N/A')"
-echo "Date:        $(date)"
-echo "Baseline:    $BASELINE_MODEL"
-echo "Checkpoints: $CHECKPOINTS"
-echo "User model:  $USER_MODEL"
-echo "Eval styles: $EVAL_STYLES"
-echo "EVAL_N=$EVAL_N SEED=$SEED"
-echo "DATA_DIR:    $DATA_DIR"
-echo "OUTPUT_DIR:  $OUTPUT_DIR"
+echo "=== EVAL ONLINE SDPO ==="
+echo "GPUs:       $(nvidia-smi -L 2>/dev/null | wc -l || echo 'N/A')"
+echo "Date:       $(date)"
+echo "Baseline:   ${BASELINE_MODEL:-<same as model>}"
+echo "Model:      $MODEL"
+echo "User model: $USER_MODEL"
+echo "Style:      $STYLE"
+echo "LR=$LR LOSS=$LOSS_MODE TRAIN_N=$TRAIN_N EVAL_N=$EVAL_N"
+echo "DATA_DIR:   $DATA_DIR"
+echo "OUTPUT_DIR: $OUTPUT_DIR"
 echo ""
 
 # =============================================================================
@@ -106,17 +96,27 @@ echo ""
 # =============================================================================
 cd "$REPO_ROOT"
 
-run "python auxiliary/eval_checkpoints.py \
-  --checkpoints $CHECKPOINTS \
-  --baseline_model \"$BASELINE_MODEL\" \
-  --eval_styles $EVAL_STYLES \
-  --val_jsonl \"$DATA_DIR/validation.jsonl\" \
-  --eval_n \"$EVAL_N\" \
-  --seed \"$SEED\" \
-  --use_vllm \
-  --judge_local \
+run "python eval_online_sdpo.py \
+  --model \"$MODEL\" \
   --user_model_name_or_path \"$USER_MODEL\" \
+  --judge_local \
   --user_vllm \
+  --lr \"$LR\" \
+  --loss_mode \"$LOSS_MODE\" \
+  --style \"$STYLE\" \
+  --use_lora \
+  --use_vllm \
+  --train_jsonl \"$DATA_DIR/train.jsonl\" \
+  --val_jsonl \"$DATA_DIR/validation.jsonl\" \
+  --train_n \"$TRAIN_N\" \
+  --eval_n \"$EVAL_N\" \
+  --eval_every \"$EVAL_EVERY\" \
+  --train_steps_per_example \"$TRAIN_STEPS_PER_EXAMPLE\" \
   --out_dir \"$OUTPUT_DIR\" \
   --run_name \"$RUN_NAME\" \
+  --seed \"$SEED\" \
+  --eval_styles $EVAL_STYLES \
+  --debug_first_example \
+  --save_checkpoints \
+  ${BASELINE_MODEL:+--baseline_model \"$BASELINE_MODEL\"} \
   \"\$@\""

@@ -22,47 +22,54 @@ class UserSimulator(ABC):
 
 STYLE_PERSONAS = {
     "concise_casual_beginner": (
-        "You are a user who specifically prefers CONCISE, CASUAL, and BEGINNER-FRIENDLY responses. "
-        "You want brief context and clear explanations, avoiding long, formal, or technically dense answers."
+        "USER PROFILE: You are a user who specifically prefers CONCISE, CASUAL, and BEGINNER-FRIENDLY responses. "
+        "You want short and clear answers, avoiding long, formal, or technically dense answers."
     ),
     "detailed_professional_expert": (
-        "You are a user who specifically prefers DETAILED, PROFESSIONAL, and EXPERT-LEVEL responses. "
-        "You want a structured, impersonal, and analytical presentation with complex sentence structures and sophisticated wording."
+        "USER PROFILE: You are a user who specifically prefers DETAILED, PROFESSIONAL, and EXPERT-LEVEL responses. "
+        "You want a structured, impersonal, and analytical presentation with sophisticated wording. However, you don't like excessively long responses and when you write messages yourself, you are concise."
     ),
     "concise_casual_expert": (
-        "You are a user who specifically prefers CONCISE and CASUAL responses and has EXPERT-LEVEL knowledge. "
+        "USER PROFILE: You are a user who specifically prefers CONCISE and CASUAL responses and has EXPERT-LEVEL knowledge. "
         "You prefer extremely short responses. You also want the tone to be extremely informal and like when the assistant uses slang."
     ),
     "concise_professional_beginner": (
-        "You are a user who specifically prefers CONCISE and PROFESSIONAL responses and has BEGINNER-LEVEL knowledge. "
+        "USER PROFILE: You are a user who specifically prefers CONCISE and PROFESSIONAL responses and has BEGINNER-LEVEL knowledge. "
         "You want extremely short responses. The tone of the assistant should be extremely formal and professional."
     ),
     "concise_professional_expert": (
-        "You are a user who specifically prefers CONCISE, PROFESSIONAL, and EXPERT-LEVEL responses. "
+        "USER PROFILE: You are a user who specifically prefers CONCISE, PROFESSIONAL, and EXPERT-LEVEL responses. "
         "You prefer extremely short responses. You also prefer very sophisticated vocabulary, complex sentence structures, and use of punctuation marks like semicolons and em-dashes."
     ),
     "detailed_casual_beginner": (
-        "You are a user who specifically prefers DETAILED, CASUAL, and BEGINNER-FRIENDLY responses. "
+        "USER PROFILE: You are a user who specifically prefers DETAILED, CASUAL, and BEGINNER-FRIENDLY responses. "
         "You want thorough, conversational explanations that walk through ideas step by step."
     ),
     "detailed_casual_expert": (
-        "You are a user who specifically prefers DETAILED and CASUAL responses and has EXPERT-LEVEL knowledge. "
+        "USER PROFILE: You are a user who specifically prefers DETAILED and CASUAL responses and has EXPERT-LEVEL knowledge. "
         "You want in-depth discussion and detailed responses. You prefer extremely casual language and dislike formal writing."
     ),
     "detailed_professional_beginner": (
-        "You are a user who specifically prefers DETAILED and PROFESSIONAL responses but has BEGINNER-LEVEL knowledge. "
+        "USER PROFILE: You are a user who specifically prefers DETAILED and PROFESSIONAL responses but has BEGINNER-LEVEL knowledge. "
         "You prefer long responses. You also prefer very simple language and dislike complex or technical vocabulary."
     ),
     "poetic": (
-        "You are a user who loves poetic, lyrical language with vivid imagery and "
-        "metaphors. You dislike plain, straightforward prose."
+        "USER PROFILE: You are a user who prefers when the assistant uses poetic, lyrical language with vivid imagery and "
+        "metaphors. You dislike when the assistant responses with plain, straightforward prose. You yourself use ordinary language."
+    ),
+    "literal": (
+        "USER PROFILE: You are a user who prefers when the assistant uses plain language that focuses on clarity. You prefer short, straightforward answers. "
+        "You dislike when the assistant responses with poetic, lyrical language."
     ),
     "no_punctuation": (
-        "You are a user who dislikes the use of punctuation marks in writing. "
+        "USER PROFILE: You are a user who dislikes the use of punctuation marks in writing. "
         "You absolutely dislike when the assistant uses any punctuation marks such as commas, em-dashes and semicolons."
     ),
     "no_emojis": (
         "USER PROFILE: You are playing the role of a user who dislikes emojis (✅,📌,🧠) and icons in assistant responses."
+    ),
+    "short": (
+        "USER PROFILE: You are a user who prefers extremely short and concise responses."
     ),
     "less_filler_praise_sycophancy": (
         "USER PROFILE: You are playing the role of a user that specifically dislikes when the assistant responses include filler praise at the beginning (such as 'Good question.' or 'Perfect!') or fillers at the end (such as 'I hope this helps!' or 'Let me know if there is anything else I can help you with.')."
@@ -70,9 +77,6 @@ STYLE_PERSONAS = {
     ),
     "answer_directly_reduce_formatting": (
         "USER PROFILE: You are playing the role of a user who prefers concise responses and dislikes long lists and excessive markdown formatting (such as ** ** and ###). You prefer plain text that is short and gets to the point quickly."
-    ),
-    "no_first_person": (
-        "USER PROFILE: You are playing the role of a user who dislikes first-person phrasing such as "I think," "I recommend," or "I would suggest." You prefer impersonal or neutral statements."
     ),
     "clarification_first": (
         "USER PROFILE:  You are playing the role of a user who likes when the assistant likes clarifying questions before proceeding when a request is ambiguous."
@@ -105,7 +109,7 @@ STYLE_PERSONAS = {
         "USER PROFILE: You are playing the role of a user who likes when the assistant drives the conversation forward themselves by asking follow-up questions."
     ),
     "committing": (
-        "USER PROFILE: You are playing the role of a user who prefers the assistant to commit to a single best answer rather than presenting multiple options. You dislike when the response includes softening adverbs such as "generally," "typically," "often," or "usually.""
+        "USER PROFILE: You are playing the role of a user who prefers the assistant to commit to a single best answer rather than presenting multiple options. You dislike when the response includes softening adverbs such as 'generally,' 'typically,' 'often,' or 'usually.'"
     ),
     "no_lists": (
         "USER PROFILE: You are playing the role of a user who dislikes when the assistant formats their response with lists and markdown formatting such as ### for headers. You prefer plain text and paragraphs."
@@ -151,6 +155,46 @@ class StyleUserSimulator(UserSimulator):
         self.max_new_tokens = max_new_tokens
         self.temperature = temperature
 
+    def _build_system(self) -> str:
+        return (
+            f"{self.system_persona}\n\n"
+            "You are simulating the *user's next message* in a chat with an AI assistant.\n"
+            "Rules:\n"
+            "- Respond as the user with the USER PROFILE above in simple language.\n"
+            "- Provide feedback ONLY to the assistant's response with respect to the preferences in the USER PROFILE.\n"
+            "- Do NOT answer the original request yourself.\n"
+            "- Do NOT give general feedback that does not relate to the USER PROFILE.\n"
+            "- Output ONLY the user message text.\n"
+        )
+
+    def _build_prompt_text(self, raw_prompt: str, completion: str) -> str:
+        """Return the fully formatted string the model sees for one example."""
+        # OLD prompt (kept for reference):
+        # user_msg = (
+        #     "You are responding from the perspective of a user that messaged an AI assistant with the following request:\n\n"
+        #     f"Request:\n{raw_prompt}\n\n"
+        #     f"The assistant responded to you with:\n{completion}\n\n"
+        #     "Based on the user profile described in the system message and nothing else, provide a brief response to the assistant whether you are happy with its response or not. "
+        #     "Carefully read the assistant's response and be specific but short if you disliked something. Respond from the perspective of the user."
+        # )
+        system = self._build_system()
+        user_msg = (
+            "Original user request:\n"
+            f"{raw_prompt}\n\n"
+            "Assistant response:\n"
+            f"{completion}\n\n"
+            "Write the user's next message:"
+        )
+        chat = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user_msg},
+        ]
+        if getattr(self.tok, "apply_chat_template", None) is not None:
+            return self.tok.apply_chat_template(
+                chat, tokenize=False, add_generation_prompt=True, enable_thinking=False,
+            )
+        return f"{self.system_persona}\n\nUser:\n{user_msg}\n\nAssistant:"
+
     @torch.no_grad()
     def generate_feedback(
         self,
@@ -165,27 +209,37 @@ class StyleUserSimulator(UserSimulator):
         eos_id = getattr(tok, "eos_token_id", None)
         pad_id = tok.pad_token_id or eos_id
 
+        # OLD prompt (kept for reference):
+        # user_msg = (
+        #     "You are responding from the perspective of a user that messaged an AI assistant with the following request:\n\n"
+        #     f"Request:\n{raw_prompt}\n\n"
+        #     f"The assistant responded to you with:\n{completion}\n\n"
+        #     "Based on the user profile described in the system message and nothing else, provide a brief response to the assistant whether you are happy with its response or not. "
+        #     "Carefully read the assistant's response and be specific but short if you disliked something. Respond from the perspective of the user."
+        # )
+        # TLDR variant (kept for reference):
+        # user_msg = (
+        #     "You are a user that asked an AI assistant to write a TL;DR summary for the following text.\n\n"
+        #     f"Original text:\n{raw_prompt}\n\n"
+        #     f"The assistant replied with this summary:\n{completion}\n\n"
+        #     "Based on the style preference in the system message, provide a one-sentence response to the assistant. "
+        #     "Say whether the summary exactly matches your preferred style or how you would like "
+        #     "the style of the summary to be changed. "
+        #     "Do NOT write a summary yourself. "
+        # )
+        system = self._build_system()
         chats = []
         for raw_prompt, completion in zip(prompts, completions):
             user_msg = (
-                "You are responding from the perspective of a user that messaged an AI assistant with the following request:\n\n"
-                f"Request:\n{raw_prompt}\n\n"
-                f"The assistant responded to you with:\n{completion}\n\n"
-                "Based on the user profile described in the system message and nothing else, provide a brief response to the assistant whether you are happy with its response or not. "
-                "Carefully read the assistant's response and be specific but short if you disliked something. Respond from the perspective of the user."
+                "Original user request:\n"
+                f"{raw_prompt}\n\n"
+                "Assistant response:\n"
+                f"{completion}\n\n"
+                "Write the user's next message:"
             )
-            # user_msg = (
-            #     "You are a user that asked an AI assistant to write a TL;DR summary for the following text.\n\n"
-            #     f"Original text:\n{raw_prompt}\n\n"
-            #     f"The assistant replied with this summary:\n{completion}\n\n"
-            #     "Based on the style preference in the system message, provide a one-sentence response to the assistant. "
-            #     "Say whether the summary exactly matches your preferred style or how you would like "
-            #     "the style of the summary to be changed. "
-            #     "Do NOT write a summary yourself. "
-            # )
             chats.append(
                 [
-                    {"role": "system", "content": self.system_persona},
+                    {"role": "system", "content": system},
                     {"role": "user", "content": user_msg},
                 ]
             )
