@@ -7,7 +7,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from simple_pg.online_sdpo_config import SDPOConfig
 from simple_pg.online_sdpo_trainer import SDPOOnlineTrainer
 from auxiliary.user_simulator import StyleUserSimulator
-from auxiliary.claude_user_simulator import ClaudeStyleUserSimulator
+from auxiliary.deepseek_user_simulator import DeepSeekStyleUserSimulator
 
 
 def parse_args():
@@ -28,7 +28,7 @@ def parse_args():
         type=str,
         default=None,
         help="If set, use a local StyleUserSimulator with this model. "
-             "If unset, ClaudeStyleUserSimulator is used (requires ANTHROPIC_API_KEY).",
+             "If unset, DeepSeekStyleUserSimulator is used (requires DEEPSEEK_API_KEY).",
     )
     return p.parse_args()
 
@@ -140,8 +140,8 @@ def main():
             style=cli.style,
         )
     else:
-        print("Using Claude user simulator (ClaudeStyleUserSimulator).")
-        user_model = ClaudeStyleUserSimulator(
+        print("Using DeepSeek user simulator (DeepSeekStyleUserSimulator).")
+        user_model = DeepSeekStyleUserSimulator(
             style=training_args.style,
             max_tokens=256,
             temperature=0.0,
