@@ -9,5 +9,8 @@ bitsandbytes
 vllm>=0.8.5,<0.9
 wandb
 
-# User simulator / judge (Claude)
+# Online SDPO training/generation (Tinker-hosted; requires TINKER_API_KEY)
+tinker
+
+# User simulator / judge (DeepSeek, via its Anthropic-compatible endpoint; requires DEEPSEEK_API_KEY)
 anthropic
