@@ -4,13 +4,19 @@ Evaluate saved checkpoints (no training) against a baseline model.
 For each checkpoint, generates completions on a validation set and runs
 pairwise judging against the baseline for one or more eval styles.
 
+Checkpoints are Tinker-hosted training-state paths (the strings printed as
+"[LIVE SDPO] Checkpoint saved -> ..." by OnlineSDPOUpdater.save_checkpoint
+during a training run, e.g. "tinker://run-id/weights/step_20"), not local
+directories — Tinker only serves its own hosted weights, not arbitrary
+local safetensors folders.
+
 Usage:
     python eval_checkpoints.py \
-        --checkpoints /path/to/step_1 /path/to/step_2 /path/to/step_3 \
+        --checkpoints tinker://run-id/weights/step_10 tinker://run-id/weights/step_20 \
         --baseline_model Qwen/Qwen3-8B \
         --eval_styles no_emojis less_filler_praise_sycophancy \
         --val_jsonl data/helpsteer_prompts/validation.jsonl \
-        --eval_n 100 --use_vllm --run_name my_ckpt_eval
+        --eval_n 100 --run_name my_ckpt_eval
 """
 import argparse
 import json
@@ -20,14 +26,63 @@ from typing import Dict, List, Optional
 
 import numpy as np
 import torch
+import tinker
+from tinker import types
 from datasets import load_dataset
 from transformers import AutoTokenizer
 
-from online_sdpo_updater_config import OnlineSDPOConfig
-from online_sdpo_updater import OnlineSDPOUpdater
 from auxiliary.vllm_user_simulator import VLLMStyleJudge
 from auxiliary.style_judge import StyleJudge
-from auxiliary.claude_style_judge import ClaudeStyleJudge
+from auxiliary.deepseek_style_judge import DeepSeekStyleJudge
+
+
+class TinkerSamplerWrapper:
+    """Thin sampling-only wrapper around a Tinker SamplingClient.
+
+    Checkpoint evaluation only ever generates text — it never trains — so
+    it has no need for a full OnlineSDPOUpdater/TrainingClient, just a
+    tokenizer (for chat-template rendering) and a SamplingClient.
+    """
+
+    def __init__(self, tokenizer, sampling_client, max_context_length: int = 4096):
+        self.tokenizer = tokenizer
+        self.sampling_client = sampling_client
+        self.max_context_length = max_context_length
+
+    def _render_prompt_ids(self, messages: List[Dict[str, str]]) -> List[int]:
+        text = self.tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True, enable_thinking=False,
+        )
+        return self.tokenizer(
+            text, add_special_tokens=False, truncation=True,
+            max_length=self.max_context_length,
+        )["input_ids"]
+
+    def generate_responses_batch(
+        self,
+        messages_list: List[List[Dict[str, str]]],
+        max_new_tokens: int,
+        temperature: float,
+    ) -> List[str]:
+        sampling_params = types.SamplingParams(
+            max_tokens=max_new_tokens, temperature=temperature, top_p=1.0,
+        )
+        # sample() (not sample_async()) is correct: this SDK's plain-named
+        # methods are synchronous and return a ConcurrentFuture immediately,
+        # while *_async methods are real asyncio coroutines.
+        futures = [
+            self.sampling_client.sample(
+                prompt=types.ModelInput.from_ints(tokens=self._render_prompt_ids(m)),
+                sampling_params=sampling_params,
+                num_samples=1,
+            )
+            for m in messages_list
+        ]
+        results = [f.result() for f in futures]
+        return [
+            self.tokenizer.decode(r.sequences[0].tokens, skip_special_tokens=True)
+            for r in results
+        ]
 
 
 # ── Metrics (shared with eval_online_sdpo.py) ────────────────────────
@@ -84,31 +139,14 @@ def compute_metrics(decisions: List[int], bootstrap_seed: Optional[int] = None) 
 # ── Evaluation helpers ────────────────────────────────────────────────
 
 def generate_eval_completions(
-    updater: OnlineSDPOUpdater,
+    updater: TinkerSamplerWrapper,
     eval_messages: List[List[Dict[str, str]]],
     max_new_tokens: int = 2048,
     temperature: float = 1.0,
 ) -> List[str]:
-    if updater.config.use_vllm:
-        return updater.generate_responses_batch(
-            eval_messages, max_new_tokens=max_new_tokens, temperature=temperature,
-        )
-    from transformers import GenerationConfig
-    original_config = updater.generation_config
-    updater.generation_config = GenerationConfig(
-        max_new_tokens=max_new_tokens,
-        do_sample=temperature > 0,
-        temperature=temperature if temperature > 0 else 1.0,
-        top_p=1.0,
-        eos_token_id=updater.tokenizer.eos_token_id,
-        pad_token_id=updater.tokenizer.pad_token_id,
+    return updater.generate_responses_batch(
+        eval_messages, max_new_tokens=max_new_tokens, temperature=temperature,
     )
-    completions = []
-    for messages in eval_messages:
-        completions.append(updater.generate_response(messages))
-    updater.generation_config = original_config
-    return completions
-
 
 def run_evaluation(
     judge,
@@ -134,9 +172,11 @@ def parse_args():
 
     # Checkpoints
     p.add_argument("--checkpoints", type=str, nargs="+", required=True,
-                    help="Paths to checkpoint directories to evaluate")
+                    help="Tinker training-state paths to evaluate, e.g. "
+                         "tinker://run-id/weights/step_20 (printed by "
+                         "OnlineSDPOUpdater.save_checkpoint during training)")
     p.add_argument("--baseline_model", type=str, required=True,
-                    help="Baseline model path or HF name for comparison")
+                    help="Baseline base model name known to Tinker (e.g. Qwen/Qwen3-8B)")
 
     # Eval styles
     p.add_argument("--eval_styles", type=str, nargs="+", required=True,
@@ -149,12 +189,11 @@ def parse_args():
     p.add_argument("--seed", type=int, default=424242)
 
     # Generation
-    p.add_argument("--use_vllm", action="store_true")
     p.add_argument("--eval_max_new_tokens", type=int, default=2048)
     p.add_argument("--temperature", type=float, default=1.0)
 
     # Judge
-    p.add_argument("--judge_model", type=str, default="claude-haiku-4-5-20251001")
+    p.add_argument("--judge_model", type=str, default="deepseek-v4-flash")
     p.add_argument("--judge_local", action="store_true",
                     help="Use local judge (requires --user_model_name_or_path)")
     p.add_argument("--user_model_name_or_path", type=str, default=None,
@@ -180,9 +219,8 @@ def main():
 
     # ── 1. Load dataset ──
     # Use baseline model tokenizer for prompt length filtering
-    is_local = os.path.isdir(args.baseline_model)
     tok = AutoTokenizer.from_pretrained(
-        args.baseline_model, use_fast=True, padding_side="left", local_files_only=is_local,
+        args.baseline_model, use_fast=True, padding_side="left",
     )
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
@@ -212,15 +250,10 @@ def main():
     print(f"[CKPT-EVAL] Eval styles:     {args.eval_styles}", flush=True)
 
     # ── 2. Generate baseline completions ──
-    print(f"\n[CKPT-EVAL] Loading baseline model: {args.baseline_model}", flush=True)
-    baseline_config = OnlineSDPOConfig(
-        model_name_or_path=args.baseline_model,
-        use_vllm=args.use_vllm,
-        use_lora=False,
-        max_new_tokens=args.eval_max_new_tokens,
-        temperature=args.temperature,
-    )
-    baseline_updater = OnlineSDPOUpdater(baseline_config)
+    print(f"\n[CKPT-EVAL] Connecting to Tinker for baseline model: {args.baseline_model}", flush=True)
+    service_client = tinker.ServiceClient()
+    baseline_sampling_client = service_client.create_sampling_client(base_model=args.baseline_model)
+    baseline_updater = TinkerSamplerWrapper(tokenizer=tok, sampling_client=baseline_sampling_client)
 
     print(f"[CKPT-EVAL] Generating baseline completions ({len(eval_messages)} prompts)...", flush=True)
     t0 = time.time()
@@ -232,7 +265,6 @@ def main():
     print(f"[CKPT-EVAL] Baseline generation took {time.time() - t0:.1f}s  avg_len={baseline_avg_len:.0f} chars", flush=True)
 
     del baseline_updater
-    torch.cuda.empty_cache()
 
     # ── 3. Initialize judges (one per eval style) ──
     from transformers import AutoModelForCausalLM
@@ -262,9 +294,8 @@ def main():
             for style in args.eval_styles:
                 judges[style] = VLLMStyleJudge(llm=user_llm, tokenizer=user_tok, style=style)
         else:
-            user_device_map = {"": "cuda:2"} if args.use_vllm else "auto"
             user_hf = AutoModelForCausalLM.from_pretrained(
-                args.user_model_name_or_path, torch_dtype=torch.bfloat16, device_map=user_device_map,
+                args.user_model_name_or_path, torch_dtype=torch.bfloat16, device_map="auto",
             )
             user_hf.eval()
             for style in args.eval_styles:
@@ -274,7 +305,7 @@ def main():
                 )
     else:
         for style in args.eval_styles:
-            judges[style] = ClaudeStyleJudge(style=style, model=args.judge_model)
+            judges[style] = DeepSeekStyleJudge(style=style, model=args.judge_model)
 
     print(f"[CKPT-EVAL] Judges initialized for styles: {list(judges.keys())}", flush=True)
 
@@ -287,15 +318,14 @@ def main():
         print(f"[CKPT-EVAL] Evaluating checkpoint: {ckpt_path}", flush=True)
         print(f"{'='*60}", flush=True)
 
-        # Load checkpoint
-        ckpt_config = OnlineSDPOConfig(
-            model_name_or_path=ckpt_path,
-            use_vllm=args.use_vllm,
-            use_lora=False,
-            max_new_tokens=args.eval_max_new_tokens,
-            temperature=args.temperature,
+        # Restore the checkpoint's weights and get a sampling-only client.
+        # No optimizer state is needed since we're only generating, not resuming training.
+        # create_training_client_from_state() (not the _async variant) returns the TrainingClient directly (no .result() needed)
+        ckpt_training_client = service_client.create_training_client_from_state(
+            path=ckpt_path,
         )
-        ckpt_updater = OnlineSDPOUpdater(ckpt_config)
+        ckpt_sampling_client = ckpt_training_client.save_weights_and_get_sampling_client()
+        ckpt_updater = TinkerSamplerWrapper(tokenizer=tok, sampling_client=ckpt_sampling_client)
 
         # Generate completions
         print(f"[CKPT-EVAL] Generating completions for {ckpt_name} ({len(eval_messages)} prompts)...", flush=True)
@@ -344,9 +374,7 @@ def main():
 
         all_results.append(ckpt_result)
 
-        # Free checkpoint model
         del ckpt_updater
-        torch.cuda.empty_cache()
 
     # ── 5. Save results ──
     results = {
@@ -358,7 +386,6 @@ def main():
             "eval_max_new_tokens": args.eval_max_new_tokens,
             "temperature": args.temperature,
             "seed": args.seed,
-            "use_vllm": args.use_vllm,
             "judge_local": args.judge_local,
             "judge_model": args.judge_model if not args.judge_local else "local",
             "user_model": args.user_model_name_or_path,
