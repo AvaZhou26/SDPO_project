@@ -1,4 +1,4 @@
-# claude_user_simulator.py
+# deepseek_user_simulator.py
 from __future__ import annotations
 
 import os
@@ -10,22 +10,28 @@ from anthropic import Anthropic
 from .user_simulator import UserSimulator, STYLE_PERSONAS
 
 
-class ClaudeStyleUserSimulator(UserSimulator):
+class DeepSeekStyleUserSimulator(UserSimulator):
     """
-    Claude-backed style user simulator (online).
+    DeepSeek-backed style user simulator (online).
 
-    Hardcoded to Claude Haiku 4.5 snapshot for consistency:
-      - claude-haiku-4-5-20251001
+    Uses DeepSeek's Anthropic-compatible API (https://api.deepseek.com/anthropic)
+    via the standard `anthropic` SDK, so the request/response shape is
+    identical to ClaudeStyleUserSimulator -- only the base_url, model name,
+    and API key differ.
+
+    Defaults to "deepseek-v4-flash"
     """
 
     def __init__(
         self,
         style: str,
+        model: str = "deepseek-v4-flash",
         max_tokens: int = 128,
         temperature: float = 0.7,
         max_retries: int = 8,
         base_backoff_s: float = 0.75,
-        api_key_env: str = "ANTHROPIC_API_KEY",
+        api_key_env: str = "DEEPSEEK_API_KEY",
+        base_url: str = "https://api.deepseek.com/anthropic",
     ):
         if style not in STYLE_PERSONAS:
             raise ValueError(
@@ -36,10 +42,8 @@ class ClaudeStyleUserSimulator(UserSimulator):
         if not api_key:
             raise RuntimeError(f"{api_key_env} is not set")
 
-        self.client = Anthropic(api_key=api_key)
-
-        # Hardcode Haiku 4.5 (snapshot). Use alias "claude-haiku-4-5" if you prefer auto-updates.
-        self.model = "claude-haiku-4-5-20251001"
+        self.client = Anthropic(api_key=api_key, base_url=base_url)
+        self.model = model
 
         self.style = style
         self.system_persona = STYLE_PERSONAS[style]
@@ -72,14 +76,20 @@ class ClaudeStyleUserSimulator(UserSimulator):
             "Write the user's next message:"
         )
 
-        # NOTE: For Claude 4.5 models on some platforms, specifying both temperature and top_p may be invalid.
-        # Keep it simple: temperature only.
         resp = self.client.messages.create(
             model=self.model,
             system=system,
             messages=[{"role": "user", "content": user}],
             max_tokens=self.max_tokens,
             temperature=self.temperature,
+            
+            """
+            DeepSeek's V4 models emit a `thinking` block by default on this endpoint, which can consume the entire max_tokens budget before
+            any reply text is generated (stop_reason "max_tokens", no text block at all). This role only needs a short one-line reply, so
+            thinking is disabled outright rather than just raising max_tokens
+            """
+            
+            thinking={"type": "disabled"},
         )
 
         # Concatenate all text blocks
@@ -114,6 +124,6 @@ class ClaudeStyleUserSimulator(UserSimulator):
                     time.sleep(self.base_backoff_s * (2**attempt))
             else:
                 raise RuntimeError(
-                    f"Claude user simulation failed after {self.max_retries} retries: {last_err}"
+                    f"DeepSeek user simulation failed after {self.max_retries} retries: {last_err}"
                 )
         return outs
