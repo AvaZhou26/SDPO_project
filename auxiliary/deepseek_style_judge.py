@@ -1,10 +1,10 @@
-# claude_style_judge.py
+# deepseek_style_judge.py
 from __future__ import annotations
 
 import os
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional
 
 from anthropic import Anthropic
@@ -12,9 +12,9 @@ from anthropic import Anthropic
 from .user_simulator import STYLE_PERSONAS
 
 
-class ClaudeStyleJudge:
+class DeepSeekStyleJudge:
     """
-    Claude-based LLM-as-a-judge for style preference.
+    DeepSeek-based LLM-as-a-judge for style preference.
 
     Decision encoding:
       0 -> prefer A
@@ -30,12 +30,13 @@ class ClaudeStyleJudge:
     def __init__(
         self,
         style: str,
-        model: str = "claude-haiku-4-5-20251001",
+        model: str = "deepseek-v4-flash",
         max_tokens: int = 512,
         temperature: float = 0.0,
         max_retries: int = 8,
         base_backoff_s: float = 0.75,
-        api_key_env: str = "ANTHROPIC_API_KEY",
+        api_key_env: str = "DEEPSEEK_API_KEY",
+        base_url: str = "https://api.deepseek.com/anthropic",
     ):
         if style not in STYLE_PERSONAS:
             raise ValueError(f"Unknown style '{style}'. Known styles: {list(STYLE_PERSONAS.keys())}")
@@ -44,7 +45,7 @@ class ClaudeStyleJudge:
         if not api_key:
             raise RuntimeError(f"{api_key_env} is not set")
 
-        self.client = Anthropic(api_key=api_key)
+        self.client = Anthropic(api_key=api_key, base_url=base_url)
         self.model = model
 
         self.system_persona = STYLE_PERSONAS[style]
@@ -88,6 +89,12 @@ class ClaudeStyleJudge:
             messages=[{"role": "user", "content": self._build_user(prompt, a, b)}],
             max_tokens=self.max_tokens,
             temperature=self.temperature,
+            """
+            See deepseek_user_simulator.py: DeepSeek's V4 models default to emitting a `thinking` block, 
+            which can eat the whole max_tokens budget before any text is produced. Disabled here since the
+            judge only needs the final "Judgement: A/B/C" line, not the reasoning trace.
+            """
+            thinking={"type": "disabled"},
         )
 
         text_parts = []
@@ -133,7 +140,7 @@ class ClaudeStyleJudge:
             except Exception as e:
                 last_err = e
                 time.sleep(self.base_backoff_s * (2**attempt))
-        raise RuntimeError(f"Claude judge failed after {self.max_retries} retries: {last_err}")
+        raise RuntimeError(f"DeepSeek judge failed after {self.max_retries} retries: {last_err}")
 
     @staticmethod
     def _invert_ab(decisions: List[int]) -> List[int]:
