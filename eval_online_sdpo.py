@@ -22,13 +22,13 @@ from typing import Dict, List, Optional
 import numpy as np
 import torch
 from datasets import load_dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from online_sdpo_updater_config import OnlineSDPOConfig
 from online_sdpo_updater import OnlineSDPOUpdater
-from auxiliary.claude_user_simulator import ClaudeStyleUserSimulator
+from auxiliary.deepseek_user_simulator import DeepSeekStyleUserSimulator
 from auxiliary.user_simulator import StyleUserSimulator
-from auxiliary.claude_style_judge import ClaudeStyleJudge
+from auxiliary.deepseek_style_judge import DeepSeekStyleJudge
 from auxiliary.style_judge import StyleJudge
 from auxiliary.vllm_user_simulator import VLLMStyleUserSimulator, VLLMStyleJudge
 
@@ -94,27 +94,9 @@ def generate_eval_completions(
     temperature: float = 1.0,
 ) -> List[str]:
     """Generate completions for all eval prompts using the current model."""
-    # Batched path (vLLM)
-    if updater.config.use_vllm:
-        return updater.generate_responses_batch(
-            eval_messages, max_new_tokens=max_new_tokens, temperature=temperature,
-        )
-
-    # Sequential fallback (HF generate)
-    original_config = updater.generation_config
-    updater.generation_config = GenerationConfig(
-        max_new_tokens=max_new_tokens,
-        do_sample=temperature > 0,
-        temperature=temperature if temperature > 0 else 1.0,
-        top_p=1.0,
-        eos_token_id=updater.tokenizer.eos_token_id,
-        pad_token_id=updater.tokenizer.pad_token_id,
+    return updater.generate_responses_batch(
+        eval_messages, max_new_tokens=max_new_tokens, temperature=temperature,
     )
-    completions = []
-    for messages in eval_messages:
-        completions.append(updater.generate_response(messages))
-    updater.generation_config = original_config
-    return completions
 
 
 def save_completions_snapshot(
@@ -167,12 +149,7 @@ def parse_args():
     # Model + training
     p.add_argument("--model", type=str, default="Qwen/Qwen3-8B")
     p.add_argument("--lr", type=float, default=5e-6)
-    p.add_argument("--use_lora", action="store_true")
-    p.add_argument("--lora_r", type=int, default=256)
-    p.add_argument("--loss_mode", type=str, default="full_distillation",
-                    choices=["simple_signal", "full_distillation"])
-    p.add_argument("--distillation_topk", type=int, default=20)
-    p.add_argument("--use_vllm", action="store_true")
+    p.add_argument("--lora_rank", type=int, default=32)
 
     # Dataset
     p.add_argument("--train_jsonl", type=str, required=True)
@@ -185,12 +162,12 @@ def parse_args():
     # User simulator
     p.add_argument("--style", type=str, default="concise_casual_beginner")
     p.add_argument("--user_model_name_or_path", type=str, default=None,
-                    help="If set, use local StyleUserSimulator. Else uses Claude API.")
+                    help="If set, use local StyleUserSimulator. Else uses DeepSeek API.")
 
     # Judge
-    p.add_argument("--judge_model", type=str, default="claude-haiku-4-5-20251001")
+    p.add_argument("--judge_model", type=str, default="deepseek-v4-flash")
     p.add_argument("--judge_local", action="store_true",
-                    help="Use local StyleJudge (shares model with user sim) instead of Claude API.")
+                    help="Use local StyleJudge (shares model with user sim) instead of DeepSeek API.")
 
     # Secondary eval styles
     p.add_argument("--eval_styles", type=str, nargs="*", default=[],
@@ -248,33 +225,26 @@ def main():
     config = OnlineSDPOConfig(
         model_name_or_path=args.model,
         learning_rate=args.lr,
-        use_lora=args.use_lora,
-        lora_r=args.lora_r,
-        loss_mode=args.loss_mode,
-        distillation_topk=args.distillation_topk,
-        use_vllm=args.use_vllm,
+        lora_rank=args.lora_rank,
         max_new_tokens=args.max_new_tokens,
         temperature=args.temperature,
         log_to_wandb=args.wandb,
         wandb_project="live-sdpo-eval",
         wandb_run_name=args.run_name,
         checkpoint_every_n_steps=1 if args.save_checkpoints else 0,
-        checkpoint_dir=os.path.join(args.out_dir, "checkpoints"),
-        max_checkpoints=999,  # keep all checkpoints
+        checkpoint_dir=args.run_name,
         train_steps_per_example=args.train_steps_per_example,
     )
 
     print(f"[EVAL] Model:      {config.model_name_or_path}", flush=True)
-    print(f"[EVAL] LoRA:       {config.use_lora} (r={config.lora_r})", flush=True)
+    print(f"[EVAL] LoRA rank:  {config.lora_rank}", flush=True)
     print(f"[EVAL] LR:         {config.learning_rate}", flush=True)
-    print(f"[EVAL] Loss mode:  {config.loss_mode}", flush=True)
-    print(f"[EVAL] vLLM:       {config.use_vllm}", flush=True)
+    print(f"[EVAL] Loss mode:  simple_signal (Tinker; only mode supported)", flush=True)
     print(f"[EVAL] Steps/ex:   {config.train_steps_per_example}", flush=True)
     print(f"[EVAL] Style:      {args.style}", flush=True)
 
     # ── 2. Load datasets ──
-    is_local = os.path.isdir(config.model_name_or_path)
-    tok = AutoTokenizer.from_pretrained(config.model_name_or_path, use_fast=True, padding_side="left", local_files_only=is_local)
+    tok = AutoTokenizer.from_pretrained(config.model_name_or_path, use_fast=True, padding_side="left")
     if tok.pad_token is None:
         tok.pad_token = tok.eos_token
 
@@ -312,8 +282,6 @@ def main():
         print(f"[EVAL] Loading separate baseline model: {args.baseline_model}", flush=True)
         baseline_config = OnlineSDPOConfig(
             model_name_or_path=args.baseline_model,
-            use_vllm=args.use_vllm,
-            use_lora=False,
             max_new_tokens=args.max_new_tokens,
             temperature=args.temperature,
         )
@@ -326,9 +294,7 @@ def main():
         )
         baseline_avg_len = sum(len(c) for c in baseline_completions) / max(len(baseline_completions), 1)
         print(f"[EVAL] Baseline generation took {time.time() - t0:.1f}s  avg_len={baseline_avg_len:.0f} chars", flush=True)
-        # Free baseline model memory before loading main model + user sim
         del baseline_updater
-        torch.cuda.empty_cache()
         baseline_generated = True
     else:
         baseline_generated = False
@@ -373,10 +339,8 @@ def main():
         )
     elif args.user_model_name_or_path is not None:
         print(f"[EVAL] Loading local user simulator: {args.user_model_name_or_path}", flush=True)
-        # Pin user model to GPU 2 when vLLM is active (GPU 0=vLLM, GPU 1=training)
-        user_device_map = {"": "cuda:2"} if args.use_vllm else "auto"
         user_hf = AutoModelForCausalLM.from_pretrained(
-            args.user_model_name_or_path, torch_dtype=torch.bfloat16, device_map=user_device_map,
+            args.user_model_name_or_path, torch_dtype=torch.bfloat16, device_map="auto",
         )
         user_hf.eval()
         user_tok = AutoTokenizer.from_pretrained(args.user_model_name_or_path, use_fast=True)
@@ -387,8 +351,8 @@ def main():
             device=next(user_hf.parameters()).device, style=args.style,
         )
     else:
-        print("[EVAL] Using Claude user simulator.", flush=True)
-        simulator = ClaudeStyleUserSimulator(style=args.style, max_tokens=256, temperature=0.0)
+        print("[EVAL] Using DeepSeek user simulator.", flush=True)
+        simulator = DeepSeekStyleUserSimulator(style=args.style, max_tokens=256, temperature=0.0)
 
     # ── 6. Initialize judge ──
     if args.judge_local:
@@ -406,8 +370,8 @@ def main():
                 device=next(user_hf.parameters()).device, style=args.style,
             )
     else:
-        print(f"[EVAL] Using ClaudeStyleJudge ({args.judge_model})", flush=True)
-        judge = ClaudeStyleJudge(style=args.style, model=args.judge_model)
+        print(f"[EVAL] Using DeepSeekStyleJudge ({args.judge_model})", flush=True)
+        judge = DeepSeekStyleJudge(style=args.style, model=args.judge_model)
 
     # ── 6b. Initialize secondary judges for additional eval styles ──
     secondary_judges = {}
@@ -425,7 +389,7 @@ def main():
                     device=next(user_hf.parameters()).device, style=sec_style,
                 )
         else:
-            secondary_judges[sec_style] = ClaudeStyleJudge(
+            secondary_judges[sec_style] = DeepSeekStyleJudge(
                 style=sec_style, model=args.judge_model,
             )
     if secondary_judges:
@@ -643,12 +607,9 @@ def main():
         "meta": {
             "model": args.model,
             "style": args.style,
-            "loss_mode": args.loss_mode,
-            "distillation_topk": args.distillation_topk,
+            "loss_mode": "simple_signal",
             "learning_rate": args.lr,
-            "use_lora": args.use_lora,
-            "lora_r": args.lora_r,
-            "use_vllm": args.use_vllm,
+            "lora_rank": args.lora_rank,
             "train_n": len(train_ds),
             "eval_n": len(eval_ds),
             "eval_every": args.eval_every,
